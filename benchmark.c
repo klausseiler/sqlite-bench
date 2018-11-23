@@ -190,7 +190,7 @@ static void stop(const char* name) {
 
   if (bytes_ > 0) {
     char *rate = malloc(sizeof(char) * 100);;
-    snprintf(rate, strlen(rate), "%6.1f MB/s",
+    snprintf(rate, strlen(rate)+12, "%6.1f MB/s",
               (bytes_ / 1048576.0) / (finish - start_));
     if (message_ && !strcmp(message_, "")) {
       message_ = strcat(strcat(rate, " "), message_);
