@@ -1,0 +1,774 @@
+Description: "EC2 Set-up for SQLite benchmark with 5 nodes"
+
+Parameters:
+  KeyName:
+    Description: "Name of an existing EC2 KeyPair to enable SSH access to the instance"
+    Type: "String"
+    Default: klaus-merapar
+  SSHKeyName:
+    Type: String
+    Description: The name of the key that will be created
+    Default: CustomDRBDKey
+  # Amazon Linux 2 AMI (HVM), SSD Volume Type
+  # amzn2-ami-hvm-2.0.20181024-x86_64-gp2 (ami-0a5e707736615003c)
+  #
+  # Red Hat Enterprise Linux 7.6 (HVM), SSD Volume Type (ami-011b3ccf1bd6db744)
+  # RHEL-7.5_HVM_GA-20180322-x86_64-1-Hourly2-GP2 (ami-7c491f05)
+  #
+  # CentOS Linux 7 x86_64 HVM EBS ENA with ENI (ami-3548444c)
+  #
+  # Ubuntu Server 18.04 LTS (HVM), SSD Volume Type (ami-00035f41c82244dab)
+  # 
+  # To get the latest Amazon Linux image
+  #LatestAmiId:
+  #  Type:  'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+  #  Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  LatestAmiId:
+    Type: String
+    AllowedValues: ['ami-7c491f05', 'ami-0a5e707736615003c', 'ami-00035f41c82244dab', 'ami-011b3ccf1bd6db744']
+    Default: ami-00035f41c82244dab
+  InstanceType:
+    Description: Testserver EC2 instance type
+    Type: String
+    Default: c5d.2xlarge
+    AllowedValues: [
+      'c5d.large', 'c5d.xlarge', 'c5d.2xlarge', 'c5d.4xlarge', 'c5d.9xlarge', 'c5d.18xlarge',
+      'i3.large', 'i3.xlarge', 'i3.2xlarge', 'i3.4xlarge', 'i3.8xlarge', 'i3.16xlarge', 'i3.metal',
+      'm5d.large', 'm5d.xlarge', 'm5d.2xlarge', 'm5d.4xlarge', 'm5d.12xlarge', 'm5d.24xlarge',
+      'r5d.large', 'r5d.xlarge', 'r5d.2xlarge', 'r5d.4xlarge', 'r5d.12xlarge', 'r5d.24xlarge',
+      'z1d.large', 'z1d.xlarge', 'z1d.2xlarge', 'z1d.3xlarge', 'z1d.6xlarge', 'z1d.12xlarge']
+    ConstraintDescription: Must be a valid EC2 instance type.
+  LaunchUserData:
+      Type: String
+      Default: |
+        #!/bin/bash -ex 
+        apt update -y
+        apt-get install -y build-essential
+        apt  install -y awscli
+        apt install -y apt-transport-https ca-certificates curl software-properties-common
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+        add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu bionic stable"
+        apt update
+        apt install -y git
+        apt-get install -y ntp
+        apt install -y docker-ce 
+        service docker start 
+        usermod -aG docker ubuntu
+        add-apt-repository -y ppa:linbit/linbit-drbd9-stack
+        apt-get update
+        debconf-set-selections <<< "postfix postfix/mailname string <myhostname>" 
+        debconf-set-selections <<< "postfix postfix/main_mailer_type select No configuration"
+        apt-get install -y drbd-utils python-drbdmanage drbd-dkms
+        pvcreate /dev/nvme0n1
+        vgcreate drbdpool /dev/nvme0n1
+        mkdir /mnt/testdb
+        chown ubuntu /mnt/testdb
+        chgrp ubuntu /mnt/testdb
+        aws ssm get-parameter --region eu-west-1 --name CustomDRBDKey --with-decryption --query Parameter.Value --output text > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keygen -y -f ~/.ssh/id_rsa >> ~/.ssh/authorized_keys
+        ssh-keyscan -t ecdsa  172.31.16.11 >> /root/.ssh/known_hosts
+        ssh-keyscan -t ecdsa  172.31.16.12 >> /root/.ssh/known_hosts
+        ssh-keyscan -t ecdsa  172.31.16.13 >> /root/.ssh/known_hosts
+        ssh-keyscan -t ecdsa  172.31.16.14 >> /root/.ssh/known_hosts
+        ssh-keyscan -t ecdsa  172.31.16.15 >> /root/.ssh/known_hosts
+
+# We're placing them close together with a high-speed network
+# this is done via Placement Groups
+Resources:
+  SSHKeyCR:
+    Type: Custom::CreateSSHKey
+    Version: "1.0"
+    Properties:
+      ServiceToken: arn:aws:lambda:eu-west-1:505546029393:function:ssh-key-gen
+      KeyName: !Ref SSHKeyName
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.31.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  SubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: eu-west-1a
+      VpcId: !Ref VPC
+      CidrBlock: 172.31.0.0/20
+      MapPublicIpOnLaunch: true
+  SubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: eu-west-1b
+      VpcId: !Ref VPC
+      CidrBlock: 172.31.16.0/20
+      MapPublicIpOnLaunch: true
+  SubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: eu-west-1c
+      VpcId: !Ref VPC
+      CidrBlock: 172.31.32.0/20
+      MapPublicIpOnLaunch: true
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  InternetRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref RouteTable
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetA
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetB
+  SubnetCRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref SubnetA
+  PlacementGroup:
+    Type: AWS::EC2::PlacementGroup
+    Properties:
+      Strategy: cluster
+
+  Ec2Instance1:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      KeyName:
+        Ref: "KeyName"
+      SecurityGroupIds: 
+        - Fn::GetAtt: InstanceSecurityGroup.GroupId
+      InstanceType: !Ref 'InstanceType'
+      ImageId: !Ref 'LatestAmiId'   
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref SubnetB
+      PrivateIpAddress: 172.31.16.11
+      Monitoring : true
+      PlacementGroupName: 
+        Ref: PlacementGroup
+      Tags:
+        -
+          Key: Name
+          Value: DRBD-Node1
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              ${Generic}
+              sleep 20
+              yes yes | drbdmanage init 172.31.16.11
+              sleep 20
+              yes yes | drbdmanage add-node ip-172-31-16-12 172.31.16.12
+              sleep 60
+              yes yes | drbdmanage add-node ip-172-31-16-13 172.31.16.13
+              sleep 60
+              yes yes | drbdmanage add-node ip-172-31-16-14 172.31.16.14
+              sleep 60
+              yes yes | drbdmanage add-node ip-172-31-16-15 172.31.16.15
+              sleep 60
+              drbdmanage add-resource r0
+              sleep 10
+              drbdmanage new-volume r0 20GB --deploy 5
+              sleep 20
+              mkfs.ext4 -E nodiscard /dev/drbd100
+              sleep 10
+              mount -o discard /dev/drbd100 /mnt/testdb
+              sudo -u ubuntu git clone -b BenchNov2018 https://github.com/klausseiler/sqlite-bench.git /home/ubuntu/sqlite-bench
+              /home/ubuntu/sqlite-bench/build.sh
+            - { Generic: !Ref LaunchUserData }
+    DependsOn: 
+      - SSHKeyCR
+
+  Ec2Instance2:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      KeyName:
+        Ref: "KeyName"
+      SecurityGroupIds:
+        - Fn::GetAtt: InstanceSecurityGroup.GroupId
+      InstanceType: !Ref 'InstanceType'
+      ImageId: !Ref 'LatestAmiId'
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref SubnetB
+      PrivateIpAddress: 172.31.16.12
+      Monitoring : true
+      PlacementGroupName: 
+        Ref: PlacementGroup
+      Tags:
+        -
+          Key: Name
+          Value: DRBD-Node2 
+      UserData:
+        Fn::Base64:
+          !Ref LaunchUserData
+    DependsOn: 
+      - SSHKeyCR
+
+  Ec2Instance3:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      KeyName:
+        Ref: "KeyName"
+      SecurityGroupIds:
+        - Fn::GetAtt: InstanceSecurityGroup.GroupId
+      InstanceType: !Ref 'InstanceType'
+      ImageId: !Ref 'LatestAmiId'
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref SubnetB
+      PrivateIpAddress: 172.31.16.13
+      Monitoring : true
+      PlacementGroupName: 
+        Ref: PlacementGroup
+      Tags:
+        -
+          Key: Name
+          Value: DRBD-Node3 
+      UserData:
+        Fn::Base64:
+          !Ref LaunchUserData
+    DependsOn: 
+      - SSHKeyCR
+
+  Ec2Instance4:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      KeyName:
+        Ref: "KeyName"
+      SecurityGroupIds:
+        - Fn::GetAtt: InstanceSecurityGroup.GroupId
+      InstanceType: !Ref 'InstanceType'
+      ImageId: !Ref 'LatestAmiId'
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref SubnetB
+      PrivateIpAddress: 172.31.16.14
+      Monitoring : true
+      PlacementGroupName: 
+        Ref: PlacementGroup
+      Tags:
+        -
+          Key: Name
+          Value: DRBD-Node4 
+      UserData:
+        Fn::Base64:
+          !Ref LaunchUserData
+    DependsOn: 
+      - SSHKeyCR
+
+  Ec2Instance5:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      KeyName:
+        Ref: "KeyName"
+      SecurityGroupIds:
+        - Fn::GetAtt: InstanceSecurityGroup.GroupId
+      InstanceType: !Ref 'InstanceType'
+      ImageId: !Ref 'LatestAmiId'
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref SubnetB
+      PrivateIpAddress: 172.31.16.15
+      Monitoring : true
+      PlacementGroupName: 
+        Ref: PlacementGroup
+      Tags:
+        -
+          Key: Name
+          Value: DRBD-Node5
+      UserData:
+        Fn::Base64:
+          !Ref LaunchUserData
+    DependsOn: 
+      - SSHKeyCR
+
+  EC2InstanceProfile:
+      Type: AWS::IAM::InstanceProfile
+      Properties:
+        Roles:
+        - Ref: EC2InstanceRole
+        Path: "/"
+      DependsOn: EC2InstanceRole
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+      - PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Action:
+            - s3:GetObject
+            Resource: "*"
+            Effect: Allow
+        PolicyName: s3-policy
+      - PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Action:
+            - logs:CreateLogStream
+            - logs:GetLogEvents
+            - logs:PutLogEvents
+            - logs:DescribeLogGroups
+            - logs:DescribeLogStreams
+            - logs:PutRetentionPolicy
+            - logs:PutMetricFilter
+            - logs:CreateLogGroup
+            Resource:
+            - arn:aws:logs:*:*:*
+            - arn:aws:s3:::*
+            Effect: Allow
+        PolicyName: cloudwatch-logs-policy
+      - PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Action:
+            - ec2:AssociateAddress
+            - ec2:DescribeAddresses
+            Resource:
+            - "*"
+            Effect: Allow
+        PolicyName: eip-policy
+      - PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Action:
+            - ssm:GetParameter
+            - ssm:GetParameters
+            Resource:
+            - "arn:aws:ssm:eu-west-1:505546029393:parameter/CustomDRBDKey"
+            Effect: Allow
+        PolicyName: getcustomkey-policy
+      - PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Action:
+            - ssm:DescribeParameters
+            Resource:
+            - "arn:aws:ssm:eu-west-1:505546029393:*"
+            Effect: Allow
+        PolicyName: listcustomkey-policy
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Effect: Allow
+        Version: '2012-10-17'
+  # We're allowing any ip address to access port 22
+  InstanceSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupName: "DRBD Group"
+      GroupDescription: "Enable Access to nodes via ssh and fully internal"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: "22"
+          ToPort: "22"
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: -1
+          CidrIp: 172.31.0.0/16
+
+  DashboardSideBySide:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: DRBDDashboard
+      DashboardBody:
+        Fn::Sub: '{
+          "widgets": [
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 1,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                      "metrics": [
+                          [ "AWS/EC2", "NetworkOut", "InstanceId", "${Ec2Instance1}" ],
+                          [ ".", "NetworkIn", ".", "." ]
+                      ],
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "region": "eu-west-1",
+                    "title": "Node1-Network",
+                    "period": 1
+                    }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 2,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                      "metrics": [
+                          [ "AWS/EC2", "NetworkOut", "InstanceId", "${Ec2Instance2}" ],
+                          [ ".", "NetworkIn", ".", "." ]
+                      ],
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "region": "eu-west-1",
+                    "title": "Node2-Network",
+                    "period": 1
+                    }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 3,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                      "metrics": [
+                          [ "AWS/EC2", "NetworkOut", "InstanceId", "${Ec2Instance3}" ],
+                          [ ".", "NetworkIn", ".", "." ]
+                      ],
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "region": "eu-west-1",
+                    "title": "Node3-Network",
+                    "period": 1
+                    }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 4,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                      "metrics": [
+                          [ "AWS/EC2", "NetworkOut", "InstanceId", "${Ec2Instance4}" ],
+                          [ ".", "NetworkIn", ".", "." ]
+                      ],
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "region": "eu-west-1",
+                    "title": "Node4-Network",
+                    "period": 1
+                    }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 5,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                      "metrics": [
+                          [ "AWS/EC2", "NetworkOut", "InstanceId", "${Ec2Instance5}" ],
+                          [ ".", "NetworkIn", ".", "." ]
+                      ],
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "region": "eu-west-1",
+                    "title": "Node5-Network",
+                    "period": 1
+                    }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 6,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "metrics": [
+                        [ "AWS/EC2", "DiskReadOps", "InstanceId", "${Ec2Instance1}" ],
+                        [ ".", "DiskWriteOps", ".", "." ]
+                    ],
+                    "region": "eu-west-1",
+                    "title": "Node1-Disk-IOps",
+                    "period": 1
+                  }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 7,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "metrics": [
+                        [ "AWS/EC2", "DiskReadOps", "InstanceId", "${Ec2Instance2}" ],
+                        [ ".", "DiskWriteOps", ".", "." ]
+                    ],
+                    "region": "eu-west-1",
+                    "title": "Node2-Disk-IOps",
+                    "period": 1
+                  }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 8,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "metrics": [
+                        [ "AWS/EC2", "DiskReadOps", "InstanceId", "${Ec2Instance3}" ],
+                        [ ".", "DiskWriteOps", ".", "." ]
+                    ],
+                    "region": "eu-west-1",
+                    "title": "Node3-Disk-IOps",
+                    "period": 1
+                  }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 9,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "metrics": [
+                        [ "AWS/EC2", "DiskReadOps", "InstanceId", "${Ec2Instance4}" ],
+                        [ ".", "DiskWriteOps", ".", "." ]
+                    ],
+                    "region": "eu-west-1",
+                    "title": "Node4-Disk-IOps",
+                    "period": 1
+                  }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 10,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "metrics": [
+                        [ "AWS/EC2", "DiskReadOps", "InstanceId", "${Ec2Instance5}" ],
+                        [ ".", "DiskWriteOps", ".", "." ]
+                    ],
+                    "region": "eu-west-1",
+                    "title": "Node5-Disk-IOps",
+                    "period": 1
+                  }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 11,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "metrics": [
+                        [ "AWS/EC2", "DiskReadBytes", "InstanceId", "${Ec2Instance1}" ],
+                        [ ".", "DiskWriteBytes", ".", "." ]
+                    ],
+                    "region": "eu-west-1",
+                    "title": "Node1-Disk-Bytes",
+                    "period": 1
+                  }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 12,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "metrics": [
+                        [ "AWS/EC2", "DiskReadBytes", "InstanceId", "${Ec2Instance2}" ],
+                        [ ".", "DiskWriteBytes", ".", "." ]
+                    ],
+                    "region": "eu-west-1",
+                    "title": "Node2-Disk-Bytes",
+                    "period": 1
+                  }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 13,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "metrics": [
+                        [ "AWS/EC2", "DiskReadBytes", "InstanceId", "${Ec2Instance3}" ],
+                        [ ".", "DiskWriteBytes", ".", "." ]
+                    ],
+                    "region": "eu-west-1",
+                    "title": "Node3-Disk-Bytes",
+                    "period": 1
+                  }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 14,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "metrics": [
+                        [ "AWS/EC2", "DiskReadBytes", "InstanceId", "${Ec2Instance4}" ],
+                        [ ".", "DiskWriteBytes", ".", "." ]
+                    ],
+                    "region": "eu-west-1",
+                    "title": "Node4-Disk-Bytes",
+                    "period": 1
+                  }
+              },
+              {
+                  "type": "metric",
+                  "x": 0,
+                  "y": 15,
+                  "width": 24,
+                  "height": 3,
+                  "properties": {
+                    "view": "timeSeries",
+                    "stacked": false,
+                    "metrics": [
+                        [ "AWS/EC2", "DiskReadBytes", "InstanceId", "${Ec2Instance5}" ],
+                        [ ".", "DiskWriteBytes", ".", "." ]
+                    ],
+                    "region": "eu-west-1",
+                    "title": "Node5-Disk-Bytes",
+                    "period": 1
+                  }
+              }
+          ]
+      }'
+
+Outputs:
+  SSHIP1:
+    Description: "IP for ssh access node 1"
+    Value:
+      Fn::Join:
+        - ""  
+        -
+          - "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i ~/.ssh/"
+          - Ref: "KeyName"
+          - ".pem ubuntu@"
+          - Fn::GetAtt:
+              - "Ec2Instance1"
+              - "PublicIp"
+  SSHIP2:
+    Description: "IP for ssh access node 2"
+    Value:
+      Fn::Join:
+        - ""
+        -
+          - "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i ~/.ssh/"
+          - Ref: "KeyName"
+          - ".pem ubuntu@"
+          - Fn::GetAtt:
+              - "Ec2Instance2"
+              - "PublicIp"
+  SSHIP3:
+    Description: "IP for ssh access node 3"
+    Value:
+      Fn::Join:
+        - ""
+        -
+          - "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i ~/.ssh/"
+          - Ref: "KeyName"
+          - ".pem ubuntu@"
+          - Fn::GetAtt:
+              - "Ec2Instance3"
+              - "PublicIp"
+  SSHIP4:
+    Description: "IP for ssh access node 4"
+    Value:
+      Fn::Join:
+        - ""
+        -
+          - "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i ~/.ssh/"
+          - Ref: "KeyName"
+          - ".pem ubuntu@"
+          - Fn::GetAtt:
+              - "Ec2Instance4"
+              - "PublicIp"
+  SSHIP5:
+    Description: "IP for ssh access node 5"
+    Value:
+      Fn::Join:
+        - ""
+        -
+          - "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i ~/.ssh/"
+          - Ref: "KeyName"
+          - ".pem ubuntu@"
+          - Fn::GetAtt:
+              - "Ec2Instance5"
+              - "PublicIp"
+  DRBDIP1:
+    Description: "Private IP for node 1"
+    Value:
+      Fn::Join:
+        - ""
+        -
+          - Fn::GetAtt:
+              - "Ec2Instance1"
+              - "PrivateIp"
+  DRBDIP2:
+    Description: "Private IP for node 2"
+    Value:
+      Fn::Join:
+        - ""
+        -
+          - Fn::GetAtt:
+              - "Ec2Instance2"
+              - "PrivateIp"
+  DRBDIP3:
+    Description: "Private IP for node 3"
+    Value:
+      Fn::Join:
+        - ""
+        -
+          - Fn::GetAtt:
+              - "Ec2Instance3"
+              - "PrivateIp"
+  DRBDIP4:
+    Description: "Private IP for node 4"
+    Value:
+      Fn::Join:
+        - ""
+        -
+          - Fn::GetAtt:
+              - "Ec2Instance4"
+              - "PrivateIp"
+  DRBDIP5:
+    Description: "Private IP for node 5"
+    Value:
+      Fn::Join:
+        - ""
+        -
+          - Fn::GetAtt:
+              - "Ec2Instance5"
+              - "PrivateIp"
